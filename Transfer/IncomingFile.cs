@@ -33,9 +33,14 @@ namespace DeskLink.Transfer
                 if (char.IsHighSurrogate(stem[stem.Length - 1])) stem = stem.Substring(0, stem.Length - 1);
                 clean = stem.TrimEnd(' ', '.') + extension;
             }
-            if (Regex.IsMatch(clean, @"^(CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|(?:COM|LPT)[0-9¹²³])\s*(?:\.|$)",
-                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)) clean = "_" + clean;
+            if (ReservedName(clean)) clean = "_" + clean;
             return clean;
+        }
+
+        internal static bool ReservedName(string name)
+        {
+            return Regex.IsMatch(name, @"^(CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|(?:COM|LPT)[0-9¹²³])\s*(?:\.|$)",
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
         }
 
         internal IncomingFile(Guid id, string name, long size, string directory)

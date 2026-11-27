@@ -150,17 +150,25 @@ namespace DeskLink.Tests
             LocalStorageChecks(root);
         }
 
+        [STAThread]
         private static int Main(string[] args)
         {
             try
             {
                 if (args.Length == 2 && args[0] == "guest") Guest(args[1]);
+                else if (args.Length == 3 && args[0] == "v2-host") UpgradeSmoke.OldHost(args[1], args[2]);
+                else if (args.Length == 3 && args[0] == "delivery") DeliverySmoke.Guest(args[1], args[2]);
                 else
                 {
                     string temp = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar);
                     string root = Path.Combine(temp, "DeskLink.Test-" + Guid.NewGuid().ToString("N"));
                     Directory.CreateDirectory(root);
-                    try { Host(root); ReconnectSmoke.Run(root); }
+                    try
+                    {
+                        if (args.Length == 2 && args[0] == "upgrade") { UpgradeSmoke.Run(root, Path.GetFullPath(args[1])); return 0; }
+                        if (args.Length == 1 && args[0] == "desktop") { DesktopSmoke.Run(root); return 0; }
+                        Host(root); ReconnectSmoke.Run(root); DeliverySmoke.Run(root); DesktopSmoke.Run(root);
+                    }
                     finally
                     {
                         if (Path.GetDirectoryName(Path.GetFullPath(root)) == temp && Path.GetFileName(root).StartsWith("DeskLink.Test-"))

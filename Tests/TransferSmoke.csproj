@@ -7,9 +7,11 @@
     <OutputPath>bin\</OutputPath>
   </PropertyGroup>
   <ItemGroup>
-    <Reference Include="System"/><Reference Include="System.Core"/><Reference Include="System.Security"/>
+    <Reference Include="System"/><Reference Include="System.Core"/><Reference Include="System.IO.Compression"/><Reference Include="System.Security"/>
+    <Reference Include="WindowsBase"/><Reference Include="PresentationCore"/><Reference Include="PresentationFramework"/><Reference Include="System.Xaml"/>
     <Reference Include="System.Runtime.Serialization"/><Reference Include="System.Xml"/>
-    <Compile Include="..\Transfer\*.cs"/><Compile Include="..\History.cs"/><Compile Include="TransferSmoke.cs"/><Compile Include="ReconnectSmoke.cs"/>
+    <ProjectReference Include="..\DeskLink.csproj"><Project>{7B93C242-7608-42B1-8968-70311F701DEE}</Project><Name>DeskLink</Name></ProjectReference>
+    <Compile Include="DesktopSmoke.cs"/><Compile Include="TransferSmoke.cs"/><Compile Include="ReconnectSmoke.cs"/><Compile Include="DeliverySmoke.cs"/><Compile Include="UpgradeSmoke.cs"/>
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets"/>
 </Project>

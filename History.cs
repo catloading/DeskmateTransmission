@@ -24,12 +24,21 @@ namespace DeskLink
         [DataMember] public string Content { get; set; }
         [DataMember] public string FilePath { get; set; }
         [DataMember] public long Size { get; set; }
+        [DataMember(EmitDefaultValue = false)] public bool IsFolder { get; set; }
+        [DataMember(EmitDefaultValue = false)] public string Digest { get; set; }
+        [DataMember(EmitDefaultValue = false)] public string SourceStamp { get; set; }
+        [DataMember(EmitDefaultValue = false)] public long WireSize { get; set; }
+        [DataMember(EmitDefaultValue = false)] public string Problem { get; set; }
+        public bool Queued { get; internal set; }
+        public bool CanCancel { get { return Queued && !Busy; } }
+        public bool CanRetry { get { return CanCancel && !string.IsNullOrEmpty(Problem); } }
+        public bool CanReselect { get { return CanRetry && IsFile; } }
         public bool Busy { get; private set; }
         public bool Failed { get; private set; }
         public double Percent { get; private set; }
         public string StateText { get; private set; }
-        public bool HasPath { get { return IsFile && !string.IsNullOrEmpty(FilePath) && !Busy && !Failed; } }
-        public string SizeText { get { return FormatSize(Size); } }
+        public bool HasPath { get { return IsFile && !string.IsNullOrEmpty(FilePath) && !Busy && !Failed && !Queued; } }
+        public string SizeText { get { return (IsFolder ? "文件夹  ·  " : "") + FormatSize(Size); } }
         public string Byline
         {
             get
@@ -51,12 +60,14 @@ namespace DeskLink
         internal void Update(string status, bool busy = false, bool failed = false, long bytes = 0)
         {
             StateText = status; Busy = busy; Failed = failed;
-            Percent = Size > 0 ? Math.Min(100, bytes * 100d / Size) : 0;
+            long total = IsFolder && busy ? WireSize : Size;
+            Percent = total > 0 ? Math.Min(100, bytes * 100d / total) : 0;
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(string.Empty));
         }
 
         internal void Complete()
         {
+            Queued = false; Problem = null;
             Update(Mine ? "对方已接收" : IsFile ? "已保存" : "已接收", bytes: Size);
         }
         public event PropertyChangedEventHandler PropertyChanged;
@@ -64,7 +75,9 @@ namespace DeskLink
 
     internal sealed class LocalStore
     {
-        private const int HistoryLimit = 200;
+        private readonly object historyLock = new object();
+        internal int RetentionDays { get; private set; } = -1; // -1: newest 200; 0: unlimited.
+        private readonly string retentionFile;
         private readonly string root;
         private readonly string history;
         private volatile string folder;
@@ -75,10 +88,14 @@ namespace DeskLink
         {
             root = directory ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TongZhuoChuan");
             history = Path.Combine(root, "history");
+            retentionFile = Path.Combine(root, "retention.txt");
             folder = Path.Combine(Downloads(), "同桌传");
             string config = Path.Combine(root, "folder.txt");
             try
             {
+                int days;
+                if (File.Exists(retentionFile) && int.TryParse(File.ReadAllText(retentionFile), out days) && ValidRetention(days))
+                    RetentionDays = days;
                 if (File.Exists(config))
                 {
                     string saved = File.ReadAllText(config);
@@ -119,11 +136,43 @@ namespace DeskLink
             string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
             try
             {
-                File.WriteAllBytes(temp, bytes);
+                using (var output = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                { output.Write(bytes, 0, bytes.Length); output.Flush(true); }
                 try { File.Move(temp, path); }
                 catch (IOException) when (File.Exists(path)) { File.Replace(temp, path, null); }
             }
             finally { if (File.Exists(temp)) File.Delete(temp); }
+        }
+
+        internal static void WritePrivate<T>(string path, T value)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(path));
+            using (var stream = new MemoryStream())
+            {
+                new DataContractJsonSerializer(typeof(T)).WriteObject(stream, value);
+                WriteAtomic(path, ProtectedData.Protect(stream.ToArray(), null, DataProtectionScope.CurrentUser));
+            }
+        }
+
+        internal static T ReadPrivate<T>(string path)
+        {
+            byte[] bytes = ProtectedData.Unprotect(File.ReadAllBytes(path), null, DataProtectionScope.CurrentUser);
+            using (var stream = new MemoryStream(bytes))
+                return (T)new DataContractJsonSerializer(typeof(T)).ReadObject(stream);
+        }
+
+        private static bool ValidRetention(int days) { return days == -1 || days == 0 || days == 7 || days == 30 || days == 90; }
+
+        internal void SetRetention(int days)
+        {
+            if (!ValidRetention(days)) throw new ArgumentOutOfRangeException(nameof(days));
+            lock (historyLock)
+            {
+                Directory.CreateDirectory(root);
+                WriteAtomic(retentionFile, Encoding.ASCII.GetBytes(days.ToString(CultureInfo.InvariantCulture)));
+                RetentionDays = days;
+                TrimHistory();
+            }
         }
 
         private IEnumerable<string> NewestFirst()
@@ -131,41 +180,47 @@ namespace DeskLink
             return Directory.EnumerateFiles(history, "*.msg").OrderByDescending(s => s, StringComparer.Ordinal);
         }
 
+        private void TrimHistory()
+        {
+            if (RetentionDays == 0 || !Directory.Exists(history)) return;
+            string cutoff = RetentionDays > 0 ? DateTime.UtcNow.AddDays(-RetentionDays).Ticks.ToString("D19", CultureInfo.InvariantCulture) : null;
+            var expired = cutoff == null ? NewestFirst().Skip(200) :
+                Directory.EnumerateFiles(history, "*.msg").Where(p => string.CompareOrdinal(Path.GetFileName(p), cutoff) < 0);
+            foreach (string path in expired.ToList()) File.Delete(path);
+        }
+
         internal List<ChatItem> Load()
         {
-            var items = new List<ChatItem>();
-            if (!Directory.Exists(history)) return items;
-            var serializer = new DataContractJsonSerializer(typeof(ChatItem));
-            foreach (string path in NewestFirst().Take(HistoryLimit).Reverse())
+            lock (historyLock)
             {
-                try
+                var items = new List<ChatItem>();
+                if (!Directory.Exists(history)) return items;
+                TrimHistory();
+                foreach (string path in NewestFirst().Reverse())
                 {
-                    byte[] data = ProtectedData.Unprotect(File.ReadAllBytes(path), null, DataProtectionScope.CurrentUser);
-                    using (var stream = new MemoryStream(data))
+                    try
                     {
-                        var item = (ChatItem)serializer.ReadObject(stream);
+                        var item = ReadPrivate<ChatItem>(path);
                         if (item == null || item.Content == null) continue;
                         item.Complete();
                         items.Add(item);
                     }
+                    catch (Exception ex) when (ex is CryptographicException || ex is SerializationException ||
+                        ex is IOException || ex is UnauthorizedAccessException) { }
                 }
-                catch (Exception ex) when (ex is CryptographicException || ex is SerializationException ||
-                    ex is IOException || ex is UnauthorizedAccessException) { }
+                return items;
             }
-            return items;
         }
 
         internal void Save(ChatItem item)
         {
-            Directory.CreateDirectory(history);
             string name = item.Utc.Ticks.ToString("D19", CultureInfo.InvariantCulture) + "-" + item.Id.ToString("N") +
                 (item.Mine ? "-out.msg" : "-in.msg");
-            using (var stream = new MemoryStream())
+            lock (historyLock)
             {
-                new DataContractJsonSerializer(typeof(ChatItem)).WriteObject(stream, item);
-                WriteAtomic(Path.Combine(history, name), ProtectedData.Protect(stream.ToArray(), null, DataProtectionScope.CurrentUser));
+                WritePrivate(Path.Combine(history, name), item);
+                TrimHistory();
             }
-            foreach (string old in NewestFirst().Skip(HistoryLimit)) File.Delete(old);
         }
     }
 }

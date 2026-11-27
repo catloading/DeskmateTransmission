@@ -24,27 +24,24 @@ namespace DeskLink
     {
         private readonly LocalStore store;
         private readonly Dictionary<string, Conversation> conversations = new Dictionary<string, Conversation>();
-        private readonly Queue<FileJob> files = new Queue<FileJob>();
+        private readonly Outbox outbox;
+        internal TrayService Tray { get; private set; }
+        private bool exitRequested, endingSession;
         private readonly DispatcherTimer noticeTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(7) };
         private readonly DispatcherTimer rosterTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
         private DeviceNetwork network;
         private Conversation selected;
         private int seenRevision = -1;
-        private bool sendingFiles, closing, readyToClose, bindingRoster, initialized;
+        private bool closing, readyToClose, bindingRoster, initialized;
         private EventWaitHandle activateWindow;
         private RegisteredWaitHandle activationWait;
-
-        private sealed class FileJob
-        {
-            internal ChatItem Item;
-            internal TransferSession Session;
-        }
 
         public MainWindow() : this(new LocalStore()) { }
 
         internal MainWindow(LocalStore localStore)
         {
             store = localStore;
+            outbox = new Outbox(store.Root);
             InitializeComponent();
             LocalName.Text = Environment.MachineName;
             LocalName.ToolTip = LocalName.Text;
@@ -53,10 +50,18 @@ namespace DeskLink
             rosterTimer.Tick += (s, e) => SyncDevices();
             try
             {
-                foreach (var item in store.Load())
-                    GetConversation(item.DeviceId ?? LegacyKey(item.Peer), item.Peer).Messages.Add(item);
+                foreach (var group in store.Load().GroupBy(i => i.DeviceId ?? LegacyKey(i.Peer)))
+                    foreach (var item in group.Skip(Math.Max(0, group.Count() - 200)))
+                        GetConversation(group.Key, item.Peer).Messages.Add(item);
+                foreach (var item in outbox.Load())
+                {
+                    var c = GetConversation(item.DeviceId, item.Peer);
+                    var prior = c.Messages.FirstOrDefault(m => m.Mine && m.Id == item.Id);
+                    if (prior != null) { outbox.Remove(item); continue; }
+                    c.Messages.Add(item);
+                }
             }
-            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException) { Notice("读取本机记录失败：" + ex.Message); }
+            catch (Exception ex) { Notice("读取本机记录失败：" + ex.Message); }
             initialized = true;
             if (conversations.Count == 0) DevicesTab.IsChecked = true;
             else RecentTab.IsChecked = true;
@@ -77,13 +82,16 @@ namespace DeskLink
                     string key = BitConverter.ToString(hash.ComputeHash(Encoding.UTF8.GetBytes(root))).Replace("-", "");
                     activateWindow = new EventWaitHandle(false, EventResetMode.AutoReset, @"Local\DeskLink-" + key, out first);
                 }
-                if (!first) { activateWindow.Set(); Close(); return; }
+                if (!first) { activateWindow.Set(); readyToClose = true; Close(); return; }
+                try { Tray = new TrayService(() => ShowConversation(null), Quit); }
+                catch (Exception ex) { Notice("托盘图标无法启用：" + ex.Message); }
+                outbox.CleanUnusedBundles();
+                if (Application.Current != null) Application.Current.SessionEnding += SessionEnding;
                 activationWait = ThreadPool.RegisterWaitForSingleObject(activateWindow, (state, timedOut) =>
                     Dispatcher.BeginInvoke(new Action(() =>
                     {
                         if (closing) return;
-                        if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
-                        Activate();
+                        ShowConversation(null);
                     })), null, Timeout.Infinite, false);
                 var service = await Task.Run(() => new DeviceNetwork(store.Root, Environment.MachineName));
                 if (closing) { service.Dispose(); return; }
@@ -210,8 +218,10 @@ namespace DeskLink
                 "在对方电脑显示配对码，再点「配对此设备」。";
             Draft.IsEnabled = c != null;
             DraftHint.Text = online ? "输入消息…" : c == null ? "选择设备后输入消息…" : "可先写草稿，连接后发送…";
-            FileButton.IsEnabled = online;
-            SendButton.IsEnabled = online && !string.IsNullOrWhiteSpace(Draft.Text);
+            FolderSend.IsEnabled = FileButton.IsEnabled = CanSend(c);
+            FileHistory.IsEnabled = c != null;
+            if (trusted && !online) DraftHint.Text = "输入后加入待发送队列…";
+            SendButton.IsEnabled = CanSend(c) && !string.IsNullOrWhiteSpace(Draft.Text);
         }
 
         private void CreateConnection(object sender, RoutedEventArgs e) { Pair(true); }
@@ -246,13 +256,14 @@ namespace DeskLink
             if (closing) { peer.Dispose(); network?.Release(peer); return; }
             var c = GetConversation(peer.Device?.Id ?? LegacyKey(peer.Name), peer.Name);
             if (c.Online) { peer.Dispose(); network?.Release(peer); return; }
-            var link = new TransferSession(peer, () => store.Folder);
+            var link = new TransferSession(peer, () => store.Folder, store);
             c.Name = peer.Name;
             c.Session = link;
+            c.LegacyLive = false;
             link.ItemReceived += update =>
             {
                 if (Dispatcher.HasShutdownStarted) return;
-                if (update.State == ReceiveState.Complete)
+                if (update.State != ReceiveState.Progress)
                     Dispatcher.Invoke(() => Receive(c, update), DispatcherPriority.Normal);
                 else
                     Dispatcher.BeginInvoke(new Action(() => Receive(c, update)), DispatcherPriority.Normal);
@@ -270,6 +281,7 @@ namespace DeskLink
             if (firstPair) FocusConversation(c); else RefreshRoster();
             NoticeBox.Visibility = Visibility.Collapsed;
             link.Start();
+            ObserveCapabilities(c, link);
         }
 
         private void DeviceAction(object sender, RoutedEventArgs e)
@@ -299,7 +311,12 @@ namespace DeskLink
             if (c == null || !c.Trusted) return;
             if (MessageBox.Show(this, "取消与「" + c.Name + "」的配对？下次连接需要重新输入配对码。", "取消配对",
                 MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No) != MessageBoxResult.Yes) return;
-            try { network.Forget(c.Key); c.Session?.Dispose(); SyncDevices(); }
+            try
+            {
+                network.Forget(c.Key); c.Session?.Dispose();
+                foreach (var item in c.Messages.Where(i => i.Queued).ToList()) CancelItem(c, item);
+                SyncDevices();
+            }
             catch (Exception ex) { Notice("取消配对失败：" + ex.Message); }
         }
 
@@ -312,7 +329,8 @@ namespace DeskLink
         private async void OnClosing(object sender, CancelEventArgs e)
         {
             if (readyToClose) return;
-            if (closing || !ConfirmInterruption(conversations.Values.SelectMany(c => c.Messages))) { e.Cancel = true; return; }
+            if (!exitRequested && Tray != null) { e.Cancel = true; Hide(); return; }
+            if (closing || !endingSession && !ConfirmInterruption(conversations.Values.SelectMany(c => c.Messages))) { e.Cancel = true; if (!closing) exitRequested = false; return; }
             closing = true; rosterTimer.Stop();
             var active = conversations.Values.Select(c => c.Session).Where(s => s != null).ToArray();
             network?.Dispose();
@@ -327,6 +345,8 @@ namespace DeskLink
         private void OnClosed(object sender, EventArgs e)
         {
             closing = true; rosterTimer.Stop(); noticeTimer.Stop();
+            if (Application.Current != null) Application.Current.SessionEnding -= SessionEnding;
+            Tray?.Dispose(); Tray = null;
             activationWait?.Unregister(null);
             activateWindow?.Dispose();
         }
@@ -336,11 +356,11 @@ namespace DeskLink
             bool follow = c == selected && (item.Mine || ChatScroll.ScrollableHeight - ChatScroll.VerticalOffset < 45);
             if (c.Messages.Count >= 200)
             {
-                var oldest = c.Messages.FirstOrDefault(m => !m.Busy);
+                var oldest = c.Messages.FirstOrDefault(m => !m.Busy && !m.Queued);
                 if (oldest != null) c.Messages.Remove(oldest);
             }
             c.Messages.Add(item);
-            if (!item.Mine && c != selected) c.Unread++;
+            if (!item.Mine && (c != selected || !IsVisible || !IsActive)) c.Unread++;
             RefreshRoster();
             if (follow) Dispatcher.BeginInvoke(new Action(ChatScroll.ScrollToEnd), DispatcherPriority.Background);
         }
@@ -358,10 +378,15 @@ namespace DeskLink
             ChatItem item;
             if (!c.Incoming.TryGetValue(update.Id, out item))
             {
-                item = new ChatItem { Id = update.Id, Peer = c.Name, DeviceId = DeviceHello.ValidId(c.Key) ? c.Key : null,
-                    Utc = DateTime.UtcNow, IsFile = update.IsFile, Content = update.Content, Size = update.Size };
-                if (update.State == ReceiveState.Started) c.Incoming.Add(update.Id, item);
-                AddItem(c, item);
+                item = c.Messages.LastOrDefault(m => !m.Mine && m.Id == update.Id);
+                if (item == null)
+                {
+                    item = new ChatItem { Id = update.Id, Peer = c.Name, DeviceId = DeviceHello.ValidId(c.Key) ? c.Key : null,
+                    Utc = update.Utc == default(DateTime) ? DateTime.UtcNow : update.Utc, IsFile = update.IsFile, IsFolder = update.IsFolder,
+                        Content = update.Content, Size = update.Size, WireSize = update.WireSize };
+                    AddItem(c, item);
+                }
+                if (update.State == ReceiveState.Started) c.Incoming[update.Id] = item;
             }
             switch (update.State)
             {
@@ -373,7 +398,9 @@ namespace DeskLink
                     item.FilePath = update.Path;
                     item.Complete();
                     c.Incoming.Remove(update.Id);
-                    Save(item);
+                    if (!update.Stored) Save(item);
+                    if (Tray != null && (!IsVisible || !IsActive || selected != c))
+                        Tray.Notify(c.Name, item.IsFile ? "收到" + (item.IsFolder ? "文件夹 " : "文件 ") + item.Content : "收到一条消息", () => ShowConversation(c));
                     break;
                 case ReceiveState.Failed:
                     item.Update(update.Error, failed: true);
@@ -386,106 +413,23 @@ namespace DeskLink
         {
             if (DraftHint == null || SendButton == null) return;
             DraftHint.Visibility = Draft.Text.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
-            SendButton.IsEnabled = Online && !string.IsNullOrWhiteSpace(Draft.Text);
+            SendButton.IsEnabled = CanSend(selected) && !string.IsNullOrWhiteSpace(Draft.Text);
         }
 
         private async void DraftKeyDown(object sender, KeyEventArgs e)
         {
+            if (e.Key == Key.V && Keyboard.Modifiers == ModifierKeys.Control && CanSend(selected))
+            {
+                try { e.Handled = PasteData(selected, Clipboard.GetDataObject()); }
+                catch (Exception ex) { e.Handled = true; Notice("粘贴失败：" + ex.Message); }
+                if (e.Handled) return;
+            }
             if (e.Key != Key.Enter || Keyboard.Modifiers != ModifierKeys.None) return;
             e.Handled = true;
             if (SendButton.IsEnabled) await SendDraft();
         }
 
         private async void SendMessage(object sender, RoutedEventArgs e) { await SendDraft(); }
-
-        private async Task SendDraft()
-        {
-            string text = Draft.Text;
-            var c = selected;
-            var link = c?.Session;
-            if (link == null || !link.Connected || string.IsNullOrWhiteSpace(text)) return;
-            var item = new ChatItem { Id = Guid.NewGuid(), Utc = DateTime.UtcNow, Mine = true, Peer = link.PeerName,
-                DeviceId = DeviceHello.ValidId(c.Key) ? c.Key : null, Content = text };
-            item.Update("发送中…", true);
-            AddItem(c, item);
-            Draft.Clear(); Draft.Focus();
-            try
-            {
-                // Keep rapid consecutive messages in compose order while files stream independently.
-                c.LastText = c.LastText.ContinueWith(_ => link.SendText(item.Id, text), TaskScheduler.Default);
-                await c.LastText;
-                item.Complete(); Save(item);
-            }
-            catch (Exception ex) { item.Update("发送未确认：" + ex.Message, failed: true); }
-        }
-
-        private void PickFiles(object sender, RoutedEventArgs e)
-        {
-            if (!Online) return;
-            var picker = new Microsoft.Win32.OpenFileDialog { Title = "选择要发送的文件", Multiselect = true, CheckFileExists = true };
-            var target = selected;
-            if (picker.ShowDialog(this) == true) EnqueueFiles(target, picker.FileNames);
-        }
-
-        private void OnDragOver(object sender, DragEventArgs e)
-        {
-            if (!e.Data.GetDataPresent(DataFormats.FileDrop)) return;
-            e.Effects = Online ? DragDropEffects.Copy : DragDropEffects.None;
-            e.Handled = true;
-        }
-
-        private void OnDrop(object sender, DragEventArgs e)
-        {
-            if (!e.Data.GetDataPresent(DataFormats.FileDrop)) return;
-            e.Handled = true;
-            if (!Online) { Notice("请先连接另一台电脑。"); return; }
-            var paths = e.Data.GetData(DataFormats.FileDrop) as string[];
-            if (paths != null) EnqueueFiles(selected, paths);
-        }
-
-        private async void EnqueueFiles(Conversation c, IEnumerable<string> paths)
-        {
-            var link = c?.Session;
-            if (link == null || !link.Connected) { Notice("设备已离线，重新连接后可发送文件。"); return; }
-            foreach (string path in paths)
-            {
-                if (Directory.Exists(path)) { Notice("发送文件夹时，请先将它压缩成一个文件。"); continue; }
-                var item = new ChatItem { Id = Guid.NewGuid(), Utc = DateTime.UtcNow, Mine = true, IsFile = true,
-                    Peer = link.PeerName, DeviceId = DeviceHello.ValidId(c.Key) ? c.Key : null, FilePath = path, Content = Path.GetFileName(path) };
-                try { item.Size = new FileInfo(path).Length; }
-                catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
-                { item.Update(ex.Message, failed: true); AddItem(c, item); continue; }
-                item.Update("排队中", true);
-                AddItem(c, item);
-                files.Enqueue(new FileJob { Item = item, Session = link });
-            }
-            if (sendingFiles) return;
-            sendingFiles = true;
-            try
-            {
-                while (files.Count > 0)
-                {
-                    var job = files.Dequeue();
-                    var item = job.Item;
-                    try
-                    {
-                        item.Update("等待对方接收…", true);
-                        var progress = new Progress<Tuple<long, long>>(p =>
-                        {
-                            if (!item.Busy) return;
-                            item.Size = p.Item2;
-                            item.Update(p.Item1 == p.Item2 ? "等待对方校验…" : "发送中  " + ChatItem.FormatSize(p.Item1) + " / " + item.SizeText,
-                                true, bytes: p.Item1);
-                        });
-                        await Task.Run(() => job.Session.SendFile(item.Id, item.FilePath, (sent, total) =>
-                            ((IProgress<Tuple<long, long>>)progress).Report(Tuple.Create(sent, total))));
-                        item.Complete(); Save(item);
-                    }
-                    catch (Exception ex) { item.Update("发送未完成：" + ex.Message, failed: true); }
-                }
-            }
-            finally { sendingFiles = false; }
-        }
 
         private void CopyMessage(object sender, RoutedEventArgs e)
         {
@@ -516,7 +460,7 @@ namespace DeskLink
         private void RevealFile(object sender, RoutedEventArgs e)
         {
             var item = (ChatItem)((Button)sender).DataContext;
-            if (!File.Exists(item.FilePath)) { Notice("文件已被移动或删除。"); return; }
+            if (!File.Exists(item.FilePath) && !Directory.Exists(item.FilePath)) { Notice("文件已被移动或删除。"); return; }
             try { Process.Start(new ProcessStartInfo("explorer.exe", "/select,\"" + item.FilePath + "\"") { UseShellExecute = false }); }
             catch (Exception ex) { Notice("打开文件位置失败：" + ex.Message); }
         }

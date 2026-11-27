@@ -8,7 +8,8 @@ namespace DeskLink.Transfer
 {
     internal enum Packet : byte
     {
-        Hello = 1, Welcome, Text, FileStart, FileData, FileEnd, FileAbort, Ready, Receipt
+        Hello = 1, Welcome, Text, FileStart, FileData, FileEnd, FileAbort, Ready, Receipt,
+        DurableText, Offer, Position, ResetPartial
     }
 
     internal sealed class Peer : IDisposable

@@ -15,6 +15,7 @@ namespace DeskLink
         internal readonly Dictionary<Guid, ChatItem> Incoming = new Dictionary<Guid, ChatItem>();
         internal TransferSession Session;
         internal Task LastText = Task.CompletedTask;
+        internal bool SendingQueuedText, SendingQueuedFile, LegacyLive;
         internal string Draft = "", PairAddress, Address;
         internal bool Trusted, Nearby, Paused, DeviceView;
         internal int Unread;

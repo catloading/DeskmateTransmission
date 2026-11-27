@@ -19,6 +19,8 @@
   <ItemGroup>
     <Reference Include="System" />
     <Reference Include="System.Core" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="System.IO.Compression" />
     <Reference Include="System.Runtime.Serialization" />
     <Reference Include="System.Security" />
     <Reference Include="System.Windows.Forms" />
@@ -32,9 +34,14 @@
     <ApplicationDefinition Include="App.xaml" />
     <Page Include="MainWindow.xaml" />
     <Page Include="PairWindow.xaml" />
+    <Page Include="FileHistoryWindow.xaml" />
+    <Page Include="ImagePreviewWindow.xaml" />
     <Compile Include="App.xaml.cs" />
-    <Compile Include="MainWindow.xaml.cs" />
+    <Compile Include="MainWindow*.cs" />
+    <Compile Include="TrayService.cs" />
     <Compile Include="PairWindow.xaml.cs" />
+    <Compile Include="FileHistoryWindow.xaml.cs" />
+    <Compile Include="ImagePreviewWindow.xaml.cs" />
     <Compile Include="History.cs" />
     <Compile Include="Conversation.cs" />
     <Compile Include="Transfer\*.cs" />

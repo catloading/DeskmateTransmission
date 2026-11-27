@@ -13,21 +13,24 @@ namespace DeskLink.Transfer
     internal sealed class Received
     {
         internal Guid Id;
-        internal bool IsFile;
+        internal bool IsFile, IsFolder, Stored;
+        internal DateTime Utc;
         internal string Content;
         internal long Size;
-        internal long Bytes;
+        internal long Bytes, WireSize;
         internal string Path;
         internal string Error;
         internal ReceiveState State;
     }
 
-    internal sealed class TransferSession : IDisposable
+    internal sealed partial class TransferSession : IDisposable
     {
         private sealed class Reply
         {
             internal bool Ok;
             internal string Error;
+            internal long Offset;
+            internal byte[] Prefix;
         }
         private sealed class Pending
         {
@@ -55,10 +58,11 @@ namespace DeskLink.Transfer
         internal bool Connected { get { return Volatile.Read(ref closed) == 0; } }
         internal Task Finished { get { return finished.Task; } }
 
-        internal TransferSession(Peer connection, Func<string> folder)
+        internal TransferSession(Peer connection, Func<string> folder, LocalStore store = null)
         {
             peer = connection;
             receiveFolder = folder;
+            if (store != null && connection.Device != null) inbox = new DeliveryInbox(store, connection.Device.Id, connection.Name);
         }
 
         internal void Start()
@@ -192,7 +196,7 @@ namespace DeskLink.Transfer
 
         private void StartFile(Guid id, BinaryReader reader)
         {
-            if (incoming != null || discarding.HasValue) throw new InvalidDataException("上一个文件尚未结束。");
+            if (incoming != null || resumable != null || discarding.HasValue) throw new InvalidDataException("上一个文件尚未结束。");
             long size = reader.ReadInt64();
             string name = Wire.GetString(reader, 2048);
             try { incoming = new IncomingFile(id, name, size, receiveFolder()); }
@@ -256,26 +260,43 @@ namespace DeskLink.Transfer
 
         private void Dispatch(Packet kind, byte[] buffer, int length)
         {
-            if (kind == Packet.FileData) { ReceiveData(buffer, length); return; }
+            if (kind == Packet.FileData)
+            {
+                if (resumable != null) DurableData(buffer, length);
+                else ReceiveData(buffer, length);
+                return;
+            }
             using (var reader = Wire.Reader(buffer, length))
             {
                 Guid id = new Guid(Wire.GetBytes(reader, 16));
                 switch (kind)
                 {
+                    case Packet.DurableText: ReceiveDurableText(id, reader); break;
+                    case Packet.Offer: ReceiveOffer(id, reader); break;
+                    case Packet.Position: ReceivePosition(id, reader); break;
+                    case Packet.ResetPartial:
+                        if (resumable == null || resumable.Record.Id != id) throw new InvalidDataException("未知的传输编号。");
+                        resumable.Reset(); break;
                     case Packet.Text:
                         string text = Wire.GetString(reader, Wire.MaxTextBytes);
                         ItemReceived?.Invoke(new Received { Id = id, Content = text, State = ReceiveState.Complete });
                         ReplyTo(Packet.Receipt, id, true);
                         break;
                     case Packet.FileStart: StartFile(id, reader); break;
-                    case Packet.FileEnd: FinishFile(id, reader); break;
+                    case Packet.FileEnd:
+                        if (resumable != null) FinishDurable(id, Wire.GetBytes(reader, 32));
+                        else FinishFile(id, reader);
+                        break;
                     case Packet.FileAbort:
                         if (discarding == id) discarding = null;
+                        if (resumable != null && resumable.Record.Id == id) SuspendDurable("已暂停，等待重新发送。");
                         if (incoming != null && incoming.Id == id) FailIncoming("发送端中止了传输。");
                         break;
                     case Packet.Ready:
                     case Packet.Receipt:
                         var reply = new Reply { Ok = reader.ReadBoolean(), Error = Wire.GetString(reader, 1024) };
+                        if (id == Guid.Empty && kind == Packet.Receipt && reply.Ok && reply.Error == Capability && inbox != null)
+                            capability.TrySetResult(true);
                         Pending item;
                         if (pending.TryGetValue(id, out item))
                             (kind == Packet.Ready ? item.Ready : item.Done).TrySetResult(reply);
@@ -291,6 +312,7 @@ namespace DeskLink.Transfer
             string reason = "连接已断开。";
             try
             {
+                if (inbox != null) ReplyTo(Packet.Receipt, Guid.Empty, true, Capability);
                 byte[] header = new byte[Wire.HeaderSize], data = new byte[Wire.MaxPayload];
                 while (Connected)
                 {
@@ -300,7 +322,7 @@ namespace DeskLink.Transfer
                 }
             }
             catch (Exception ex) when (ex is IOException || ex is InvalidOperationException ||
-                ex is System.Net.Sockets.SocketException || ex is CryptographicException || ex is ArgumentException)
+                ex is System.Net.Sockets.SocketException || ex is CryptographicException || ex is ArgumentException || ex is InvalidDataException)
             {
                 if (Connected) reason = ex is EndOfStreamException ? "对方已断开连接。" : "连接已中断。";
             }
@@ -310,6 +332,7 @@ namespace DeskLink.Transfer
                 {
                     Dispose();
                     if (incoming != null) FailIncoming("连接中断，文件未收全。");
+                    if (resumable != null) SuspendDurable("连接中断，已保留接收进度。");
                     Ended?.Invoke(reason);
                 }
                 finally { finished.TrySetResult(true); }
@@ -319,6 +342,7 @@ namespace DeskLink.Transfer
         public void Dispose()
         {
             if (Interlocked.Exchange(ref closed, 1) != 0) return;
+            capability.TrySetResult(false);
             var disconnected = new Reply { Error = "连接中断，未收到对方确认。" };
             foreach (var item in pending.Values)
             {
