@@ -1,0 +1,15 @@
+<Project ToolsVersion="15.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>DeskLink.Smoke</AssemblyName>
+    <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
+    <LangVersion>7.3</LangVersion>
+    <OutputPath>bin\</OutputPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System"/><Reference Include="System.Core"/><Reference Include="System.Security"/>
+    <Reference Include="System.Runtime.Serialization"/><Reference Include="System.Xml"/>
+    <Compile Include="..\Transfer\*.cs"/><Compile Include="..\History.cs"/><Compile Include="TransferSmoke.cs"/><Compile Include="ReconnectSmoke.cs"/>
+  </ItemGroup>
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets"/>
+</Project>
